@@ -1,0 +1,32 @@
+# Flight Hacker Webserver - Docker Compose
+# Run with: docker-compose -f docker-compose.webserver.yml up --build
+#
+# This starts the webserver container which can:
+# 1. Serve the dashboard UI on http://localhost:8000
+# 2. Trigger parallel scanner containers via the Docker socket
+# 3. Monitor scanner progress in real-time
+
+version: '3.8'
+
+services:
+  webserver:
+    build:
+      context: .
+      dockerfile: Dockerfile.webserver
+    container_name: flight-hacker-webserver
+    ports:
+      - "8000:8000"
+    volumes:
+      # Output directory for results and status files
+      - ./output:/app/output
+      # SQLite database
+      - ./flights.db:/app/flights.db
+      # Docker socket for triggering scanner containers
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Project files for generating docker-compose.yml
+      - .:/app/project:ro
+      # VPN configs directory
+      - ./vpn_configs:/app/vpn_configs
+    environment:
+      - PYTHONUNBUFFERED=1
+    restart: unless-stopped

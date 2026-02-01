@@ -1,0 +1,30 @@
+# Flight Hacker Webserver Container
+# Provides dashboard UI and can trigger parallel scanner containers
+FROM python:3.11-slim
+
+# Install system dependencies including Docker CLI
+RUN apt-get update && apt-get install -y \
+    curl \
+    docker.io \
+    docker-compose \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Python dependencies
+RUN pip install --no-cache-dir requests
+
+# Create app directory
+WORKDIR /app
+
+# Copy application code
+COPY web_server.py flight_tracker.py run-parallel-scan.py /app/
+COPY scrapers/ /app/scrapers/
+
+# Create output directory
+RUN mkdir -p /app/output
+
+# Environment variables
+ENV PYTHONUNBUFFERED=1
+
+EXPOSE 8000
+
+CMD ["python3", "web_server.py"]

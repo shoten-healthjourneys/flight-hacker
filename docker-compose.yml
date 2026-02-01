@@ -8,7 +8,7 @@ services:
     environment:
       - VPN_COUNTRY=
       - ORIGIN=LHR
-      - DESTINATION=BOM
+      - DESTINATION=ARL
       - DEPARTURE_DATE=2026-02-16
       - RETURN_DATE=2026-02-23
       - OUTPUT_FILE=/app/output/UK.json
@@ -25,28 +25,10 @@ services:
     environment:
       - VPN_COUNTRY=JP
       - ORIGIN=LHR
-      - DESTINATION=BOM
+      - DESTINATION=ARL
       - DEPARTURE_DATE=2026-02-16
       - RETURN_DATE=2026-02-23
       - OUTPUT_FILE=/app/output/JP.json
-    volumes:
-      - ./output:/app/output
-      - ./vpn_configs:/app/vpn_configs:ro
-    cap_add:
-      - NET_ADMIN
-    devices:
-      - /dev/net/tun:/dev/net/tun
-
-  scanner-hk:
-    build: .
-    container_name: flight-scanner-hk
-    environment:
-      - VPN_COUNTRY=HK
-      - ORIGIN=LHR
-      - DESTINATION=BOM
-      - DEPARTURE_DATE=2026-02-16
-      - RETURN_DATE=2026-02-23
-      - OUTPUT_FILE=/app/output/HK.json
     volumes:
       - ./output:/app/output
       - ./vpn_configs:/app/vpn_configs:ro
@@ -61,7 +43,7 @@ services:
     environment:
       - VPN_COUNTRY=KR
       - ORIGIN=LHR
-      - DESTINATION=BOM
+      - DESTINATION=ARL
       - DEPARTURE_DATE=2026-02-16
       - RETURN_DATE=2026-02-23
       - OUTPUT_FILE=/app/output/KR.json
@@ -73,16 +55,16 @@ services:
     devices:
       - /dev/net/tun:/dev/net/tun
 
-  scanner-vn:
+  scanner-ca:
     build: .
-    container_name: flight-scanner-vn
+    container_name: flight-scanner-ca
     environment:
-      - VPN_COUNTRY=VN
+      - VPN_COUNTRY=CA
       - ORIGIN=LHR
-      - DESTINATION=BOM
+      - DESTINATION=ARL
       - DEPARTURE_DATE=2026-02-16
       - RETURN_DATE=2026-02-23
-      - OUTPUT_FILE=/app/output/VN.json
+      - OUTPUT_FILE=/app/output/CA.json
     volumes:
       - ./output:/app/output
       - ./vpn_configs:/app/vpn_configs:ro
@@ -97,7 +79,7 @@ services:
     environment:
       - VPN_COUNTRY=RU
       - ORIGIN=LHR
-      - DESTINATION=BOM
+      - DESTINATION=ARL
       - DEPARTURE_DATE=2026-02-16
       - RETURN_DATE=2026-02-23
       - OUTPUT_FILE=/app/output/RU.json
@@ -115,28 +97,10 @@ services:
     environment:
       - VPN_COUNTRY=TH
       - ORIGIN=LHR
-      - DESTINATION=BOM
+      - DESTINATION=ARL
       - DEPARTURE_DATE=2026-02-16
       - RETURN_DATE=2026-02-23
       - OUTPUT_FILE=/app/output/TH.json
-    volumes:
-      - ./output:/app/output
-      - ./vpn_configs:/app/vpn_configs:ro
-    cap_add:
-      - NET_ADMIN
-    devices:
-      - /dev/net/tun:/dev/net/tun
-
-  scanner-ir:
-    build: .
-    container_name: flight-scanner-ir
-    environment:
-      - VPN_COUNTRY=IR
-      - ORIGIN=LHR
-      - DESTINATION=BOM
-      - DEPARTURE_DATE=2026-02-16
-      - RETURN_DATE=2026-02-23
-      - OUTPUT_FILE=/app/output/IR.json
     volumes:
       - ./output:/app/output
       - ./vpn_configs:/app/vpn_configs:ro

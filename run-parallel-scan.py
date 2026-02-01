@@ -2,6 +2,10 @@
 """
 Flight Hacker - Parallel VPN Scanner
 Downloads fresh VPN configs from VPNGate and runs parallel Docker containers
+
+This module can be:
+1. Run directly: python3 run-parallel-scan.py [origin] [destination] [dep_date] [ret_date]
+2. Imported: from `run-parallel-scan` import fetch_vpngate_configs, generate_docker_compose
 """
 
 import subprocess
@@ -34,8 +38,17 @@ def log(msg):
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
 
 
-def fetch_vpngate_configs():
-    """Download fresh VPN configs from VPNGate"""
+def fetch_vpngate_configs(output_dir=None):
+    """
+    Download fresh VPN configs from VPNGate
+
+    Args:
+        output_dir: Directory to save configs. Defaults to PROJECT_DIR/vpn_configs
+
+    Returns:
+        List of country codes with saved configs
+    """
+    vpn_dir = Path(output_dir) if output_dir else VPN_CONFIGS_DIR
     log("Fetching VPNGate server list...")
 
     try:
@@ -77,13 +90,13 @@ def fetch_vpngate_configs():
             continue
 
     # Save configs
-    VPN_CONFIGS_DIR.mkdir(exist_ok=True)
+    vpn_dir.mkdir(exist_ok=True)
     saved = []
 
     for country, data in best_servers.items():
         try:
             config = base64.b64decode(data['config_b64']).decode('utf-8')
-            filepath = VPN_CONFIGS_DIR / f"{country}.ovpn"
+            filepath = vpn_dir / f"{country}.ovpn"
             with open(filepath, 'w') as f:
                 f.write(config)
             saved.append(country)
@@ -92,15 +105,32 @@ def fetch_vpngate_configs():
             log(f"  {country}: Error - {e}")
 
     # Create credentials file
-    creds_file = VPN_CONFIGS_DIR / "credentials.txt"
+    creds_file = vpn_dir / "credentials.txt"
     with open(creds_file, 'w') as f:
         f.write("vpn\nvpn\n")
 
     return saved
 
 
-def generate_docker_compose(countries, origin, destination, dep_date, ret_date):
-    """Generate docker-compose.yml for all VPN locations"""
+def generate_docker_compose(countries, origin, destination, dep_date, ret_date,
+                           output_path=None, project_dir=None):
+    """
+    Generate docker-compose.yml for all VPN locations
+
+    Args:
+        countries: List of country codes to create scanner services for
+        origin: Airport code (e.g., 'LHR')
+        destination: Airport code (e.g., 'BOM')
+        dep_date: Departure date (YYYY-MM-DD)
+        ret_date: Return date (YYYY-MM-DD)
+        output_path: Path to write compose file. Defaults to PROJECT_DIR/docker-compose.yml
+        project_dir: Project directory for build context. Defaults to PROJECT_DIR
+
+    Returns:
+        Path to generated compose file
+    """
+    proj_dir = Path(project_dir) if project_dir else PROJECT_DIR
+    compose_path = Path(output_path) if output_path else proj_dir / "docker-compose.yml"
 
     services = {}
 
@@ -167,7 +197,6 @@ def generate_docker_compose(countries, origin, destination, dep_date, ret_date):
         yaml_content += f"      - /dev/net/tun:/dev/net/tun\n"
         yaml_content += "\n"
 
-    compose_path = PROJECT_DIR / "docker-compose.yml"
     with open(compose_path, 'w') as f:
         f.write(yaml_content)
 
@@ -175,9 +204,10 @@ def generate_docker_compose(countries, origin, destination, dep_date, ret_date):
     return compose_path
 
 
-def init_database():
+def init_database(db_path=None):
     """Initialize SQLite database"""
-    conn = sqlite3.connect(DB_PATH)
+    db = db_path or DB_PATH
+    conn = sqlite3.connect(db)
     cursor = conn.cursor()
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS flights (
@@ -201,16 +231,19 @@ def init_database():
     conn.close()
 
 
-def clear_old_results():
+def clear_old_results(output_dir=None, db_path=None):
     """Clear previous scan results"""
+    out_dir = Path(output_dir) if output_dir else OUTPUT_DIR
+    db = db_path or DB_PATH
+
     # Clear output JSON files
-    OUTPUT_DIR.mkdir(exist_ok=True)
-    for f in OUTPUT_DIR.glob("*.json"):
+    out_dir.mkdir(exist_ok=True)
+    for f in out_dir.glob("*.json"):
         f.unlink()
 
     # Clear database
-    if DB_PATH.exists():
-        conn = sqlite3.connect(DB_PATH)
+    if Path(db).exists():
+        conn = sqlite3.connect(db)
         conn.execute("DELETE FROM flights")
         conn.commit()
         conn.close()
@@ -218,15 +251,22 @@ def clear_old_results():
     log("Cleared previous results")
 
 
-def aggregate_results():
+def aggregate_results(output_dir=None, db_path=None):
     """Aggregate JSON results into database"""
-    init_database()
+    out_dir = Path(output_dir) if output_dir else OUTPUT_DIR
+    db = db_path or DB_PATH
 
-    conn = sqlite3.connect(DB_PATH)
+    init_database(db)
+
+    conn = sqlite3.connect(db)
     cursor = conn.cursor()
 
     total = 0
-    for json_file in OUTPUT_DIR.glob("*.json"):
+    for json_file in out_dir.glob("*.json"):
+        # Skip status files
+        if json_file.name.startswith("status_"):
+            continue
+
         try:
             with open(json_file) as f:
                 results = json.load(f)

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Flight Hacker - Web Server
-Dashboard + Scanner Launcher in one
+Dashboard + Parallel Scanner Controller
 """
 
 import http.server
@@ -12,6 +12,8 @@ import threading
 import queue
 import time
 import sys
+import subprocess
+import os
 import requests
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -20,21 +22,35 @@ from datetime import datetime
 sys.path.insert(0, str(Path(__file__).parent))
 
 from flight_tracker import init_database, add_flight_result, get_best_deals, get_flight_by_id
-from scrapers.google_flights import search_google_flights, PLAYWRIGHT_AVAILABLE
+
+# Import parallel scan functions
+try:
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("run_parallel_scan", Path(__file__).parent / "run-parallel-scan.py")
+    run_parallel_scan = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(run_parallel_scan)
+    fetch_vpngate_configs = run_parallel_scan.fetch_vpngate_configs
+    generate_docker_compose = run_parallel_scan.generate_docker_compose
+    aggregate_results = run_parallel_scan.aggregate_results
+    clear_old_results = run_parallel_scan.clear_old_results
+    PARALLEL_AVAILABLE = True
+except Exception as e:
+    print(f"Warning: Parallel scan not available: {e}")
+    PARALLEL_AVAILABLE = False
 
 PORT = 8000
-DB_PATH = Path(__file__).parent / "flights.db"
+PROJECT_DIR = Path(__file__).parent
+DB_PATH = PROJECT_DIR / "flights.db"
+OUTPUT_DIR = PROJECT_DIR / "output"
 
-# Scanner state
+# Log queue for real-time logs
 log_queue = queue.Queue()
-scan_status = {'running': False, 'vpn_waiting': False, 'location': 'Unknown', 'phase': ''}
 
-# Search config (defaults, can be overridden from UI)
-search_config = {
-    'origin': 'LHR',
-    'destination': 'BOM',
-    'departure_dates': ['2026-02-16', '2026-02-17', '2026-02-18'],
-    'return_dates': ['2026-02-23', '2026-02-24']
+# Parallel scan state
+parallel_scan_status = {
+    'running': False,
+    'countries': [],
+    'start_time': None
 }
 
 
@@ -45,7 +61,7 @@ def log(message: str):
 
 
 def get_current_location() -> dict:
-    """Get current IP location using multiple APIs as fallback"""
+    """Get current IP location"""
     apis = [
         ('http://ip-api.com/json/', lambda d: {
             'country': d.get('country', 'Unknown'),
@@ -59,154 +75,142 @@ def get_current_location() -> dict:
             'city': d.get('city', 'Unknown'),
             'ip': d.get('ip', 'Unknown')
         }),
-        ('https://ipinfo.io/json', lambda d: {
-            'country': d.get('country', 'Unknown'),
-            'country_code': d.get('country', 'XX'),
-            'city': d.get('city', 'Unknown'),
-            'ip': d.get('ip', 'Unknown')
-        }),
     ]
 
     for url, parser in apis:
         try:
             response = requests.get(url, timeout=5)
             if response.status_code == 200:
-                data = response.json()
-                result = parser(data)
-                if result['country_code'] != 'XX' and result['ip'] != 'Unknown':
-                    return result
+                return parser(response.json())
         except:
             continue
 
     return {'country': 'Unknown', 'country_code': 'XX', 'city': 'Unknown', 'ip': 'Unknown'}
 
 
-def run_scan_phase():
-    location = get_current_location()
-    location_label = f"{location['country_code']} - {location['city']}"
-    country_code = location['country_code'] if location['country_code'] != 'XX' else None
-    scan_status['location'] = location_label
+def get_scanner_statuses():
+    """Read all status_*.json files from output directory"""
+    statuses = []
+    OUTPUT_DIR.mkdir(exist_ok=True)
 
-    # Log which Google domain will be used
-    domains = {'US': 'google.com', 'GB': 'google.co.uk', 'NL': 'google.nl', 'JP': 'google.co.jp'}
-    domain = domains.get(country_code, 'google.com')
-    log(f"  Using {domain} (country: {country_code or 'default'})")
+    for status_file in OUTPUT_DIR.glob("status_*.json"):
+        try:
+            with open(status_file) as f:
+                status = json.load(f)
+                statuses.append(status)
+        except:
+            pass
 
-    results = []
-    dep_dates = search_config['departure_dates']
-    ret_dates = search_config['return_dates']
-    total = len(dep_dates) * len(ret_dates)
-    count = 0
-
-    for dep_date in dep_dates:
-        for ret_date in ret_dates:
-            if not scan_status['running']:
-                return results
-            count += 1
-            log(f"  [{count}/{total}] {dep_date} → {ret_date}")
-            try:
-                gf_results = search_google_flights(
-                    origin=search_config['origin'],
-                    destination=search_config['destination'],
-                    departure_date=dep_date, return_date=ret_date,
-                    headless=True,
-                    country_code=country_code
-                )
-                for r in gf_results:
-                    r['vpn_location'] = location_label
-                    add_flight_result(r)
-                    results.append(r)
-                log(f"      Found {len(gf_results)} flights")
-            except Exception as e:
-                log(f"      Error: {e}")
-
-    return results
+    return statuses
 
 
-def run_full_scan():
-    global scan_status
-    scan_status['running'] = True
-    scan_status['vpn_waiting'] = False
+def run_parallel_scan_thread(config):
+    """Run parallel scan in background thread"""
+    global parallel_scan_status
 
-    log("=" * 50)
-    log("STARTING FLIGHT SCAN")
-    log(f"Route: {search_config['origin']} → {search_config['destination']}")
-    log(f"Departures: {', '.join(search_config['departure_dates'])}")
-    log(f"Returns: {', '.join(search_config['return_dates'])}")
-    log("=" * 50)
+    try:
+        parallel_scan_status['running'] = True
+        parallel_scan_status['start_time'] = datetime.now().isoformat()
 
-    init_database()
-    all_results = []
+        origin = config.get('origin', 'LHR')
+        destination = config.get('destination', 'BOM')
+        dep_date = config.get('departure_date', '2026-02-16')
+        ret_date = config.get('return_date', '2026-02-23')
+        countries = config.get('countries', [])
 
-    # Phase 1: Current location
-    scan_status['phase'] = 'UK Scan'
-    log("")
-    log("PHASE 1: Scanning from current location")
-    results = run_scan_phase()
-    all_results.extend(results)
-    log(f"Phase 1 complete: {len(results)} flights")
+        log(f"Starting parallel scan: {origin} -> {destination}")
+        log(f"Dates: {dep_date} to {ret_date}")
 
-    if not scan_status['running']:
-        log("Scan stopped")
-        return
+        # Clear old results
+        clear_old_results(OUTPUT_DIR, DB_PATH)
 
-    # Phase 2: VPN
-    scan_status['phase'] = 'Waiting for VPN'
-    log("")
-    log("=" * 50)
-    log("PHASE 2: Connect your VPN now!")
-    log("=" * 50)
-    scan_status['vpn_waiting'] = True
+        # Fetch VPN configs if not specified
+        if not countries:
+            log("Fetching VPN servers from VPNGate...")
+            countries = fetch_vpngate_configs(PROJECT_DIR / "vpn_configs")
 
-    start_loc = get_current_location()
-    start_ip = start_loc['ip']
-    start_country = start_loc['country_code']
-    log(f"Current IP: {start_ip} ({start_country})")
-    start_time = time.time()
+        parallel_scan_status['countries'] = ['UK'] + countries
+        log(f"Will scan from {len(parallel_scan_status['countries'])} locations: UK, {', '.join(countries)}")
 
-    while time.time() - start_time < 120:
-        if not scan_status['running']:
-            log("Scan stopped")
-            scan_status['vpn_waiting'] = False
+        # Generate docker-compose.yml
+        compose_path = generate_docker_compose(
+            countries, origin, destination, dep_date, ret_date,
+            output_path=PROJECT_DIR / "docker-compose.yml",
+            project_dir=PROJECT_DIR
+        )
+
+        # Build and run containers
+        log("Building scanner containers...")
+        build_result = subprocess.run(
+            ["docker-compose", "build"],
+            cwd=PROJECT_DIR,
+            capture_output=True,
+            text=True
+        )
+
+        if build_result.returncode != 0:
+            log(f"Build failed: {build_result.stderr}")
+            parallel_scan_status['running'] = False
             return
 
-        time.sleep(3)
-        loc = get_current_location()
-        scan_status['location'] = f"{loc['country_code']} - {loc['city']}"
+        log("Launching parallel scanners...")
+        subprocess.run(
+            ["docker-compose", "up", "-d"],
+            cwd=PROJECT_DIR,
+            capture_output=True,
+            text=True
+        )
 
-        # Detect VPN by IP change OR country change
-        if loc['ip'] != start_ip and loc['ip'] != 'Unknown':
-            log(f"IP changed: {start_ip} -> {loc['ip']}")
-            log(f"VPN Connected: {loc['city']}, {loc['country']}")
-            scan_status['vpn_waiting'] = False
-            break
+        # Monitor containers until all complete
+        while parallel_scan_status['running']:
+            ps_result = subprocess.run(
+                ["docker-compose", "ps", "-q"],
+                cwd=PROJECT_DIR,
+                capture_output=True,
+                text=True
+            )
 
-        if loc['country_code'] != start_country and loc['country_code'] != 'XX':
-            log(f"VPN Connected: {loc['city']}, {loc['country']}")
-            scan_status['vpn_waiting'] = False
-            break
-    else:
-        log("VPN timeout - skipping")
-        scan_status['vpn_waiting'] = False
-        scan_status['running'] = False
-        return
+            if not ps_result.stdout.strip():
+                break
 
-    scan_status['phase'] = 'VPN Scan'
-    results = run_scan_phase()
-    all_results.extend(results)
+            statuses = get_scanner_statuses()
+            complete_count = sum(1 for s in statuses if s.get('status') == 'complete')
+            total_count = len(parallel_scan_status['countries'])
 
-    # Done
-    log("")
-    log("=" * 50)
-    log("SCAN COMPLETE")
-    log(f"Total: {len(all_results)} flights found")
-    if all_results:
-        best = min(all_results, key=lambda x: x.get('price_gbp', float('inf')))
-        log(f"Best: £{best['price_gbp']:.0f} ({best.get('airline', 'Unknown')})")
-    log("=" * 50)
+            if complete_count >= total_count:
+                break
 
-    scan_status['running'] = False
-    scan_status['phase'] = 'Complete'
+            time.sleep(2)
+
+        # Aggregate results
+        if parallel_scan_status['running']:
+            log("Aggregating results...")
+            total = aggregate_results(OUTPUT_DIR, DB_PATH)
+            log(f"Scan complete: {total} flights found")
+
+    except Exception as e:
+        log(f"Parallel scan error: {e}")
+    finally:
+        parallel_scan_status['running'] = False
+
+
+def stop_parallel_scan():
+    """Stop running parallel scan containers"""
+    global parallel_scan_status
+
+    try:
+        subprocess.run(
+            ["docker-compose", "down"],
+            cwd=PROJECT_DIR,
+            capture_output=True,
+            text=True
+        )
+        log("Scanners stopped")
+    except Exception as e:
+        log(f"Error stopping scanners: {e}")
+
+    parallel_scan_status['running'] = False
+    parallel_scan_status['countries'] = []
 
 
 class Handler(http.server.SimpleHTTPRequestHandler):
@@ -214,28 +218,76 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         path = urlparse(self.path).path
 
         if path == '/' or path == '/index.html':
-            self.serve_launcher()
-        elif path == '/dashboard':
             self.serve_dashboard()
         elif path == '/api/data':
             self.serve_api_data()
         elif path == '/api/logs':
             self.serve_logs()
-        elif path == '/api/status':
-            self.serve_status()
+        elif path == '/api/scanner-status':
+            self.serve_scanner_status()
         else:
             self.send_error(404)
 
     def do_POST(self):
         path = urlparse(self.path).path
         if path == '/api/start':
-            self.start_scan()
+            self.start_parallel_scan()
         elif path == '/api/stop':
-            self.stop_scan()
+            self.stop_parallel_scan()
         else:
             self.send_error(404)
 
-    def serve_launcher(self):
+    def serve_scanner_status(self):
+        """Return status of all scanner containers"""
+        statuses = get_scanner_statuses()
+
+        total_flights = sum(s.get('progress', {}).get('flights_found', 0) for s in statuses)
+        complete_count = sum(1 for s in statuses if s.get('status') == 'complete')
+        error_count = sum(1 for s in statuses if s.get('status') == 'error')
+
+        self.send_json({
+            'parallel_running': parallel_scan_status['running'],
+            'countries': parallel_scan_status['countries'],
+            'start_time': parallel_scan_status['start_time'],
+            'scanners': statuses,
+            'summary': {
+                'total_scanners': len(parallel_scan_status['countries']),
+                'complete': complete_count,
+                'errors': error_count,
+                'total_flights': total_flights
+            }
+        })
+
+    def start_parallel_scan(self):
+        """Start parallel scan with provided config"""
+        global parallel_scan_status
+
+        if parallel_scan_status['running']:
+            self.send_json({'ok': False, 'error': 'Scan already running'})
+            return
+
+        if not PARALLEL_AVAILABLE:
+            self.send_json({'ok': False, 'error': 'Parallel scan not available'})
+            return
+
+        try:
+            content_length = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(content_length).decode('utf-8') if content_length > 0 else '{}'
+            config = json.loads(body)
+
+            thread = threading.Thread(target=run_parallel_scan_thread, args=(config,), daemon=True)
+            thread.start()
+
+            self.send_json({'ok': True, 'message': 'Scan started'})
+        except Exception as e:
+            self.send_json({'ok': False, 'error': str(e)})
+
+    def stop_parallel_scan(self):
+        """Stop parallel scan"""
+        stop_parallel_scan()
+        self.send_json({'ok': True, 'message': 'Scan stopped'})
+
+    def serve_dashboard(self):
         html = '''<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -250,7 +302,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             color: #fff;
             min-height: 100vh;
         }
-        .container { max-width: 1200px; margin: 0 auto; padding: 20px; }
+        .container { max-width: 1400px; margin: 0 auto; padding: 20px; }
 
         header {
             text-align: center;
@@ -260,47 +312,21 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             margin-bottom: 30px;
         }
         h1 { font-size: 3em; margin-bottom: 10px; }
-        .route { font-size: 1.5em; color: #a0a0a0; }
-
-        .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
-        @media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
-        @media (max-width: 900px) { .panel[style*="span 2"] { grid-column: span 1 !important; } }
+        .subtitle { font-size: 1.3em; color: #a0a0a0; }
 
         .panel {
             background: rgba(255,255,255,0.08);
             border-radius: 15px;
             padding: 25px;
+            margin-bottom: 20px;
         }
         .panel h2 { margin-bottom: 20px; color: #667eea; }
 
-        .controls { display: flex; gap: 15px; margin-bottom: 20px; }
-        button {
-            flex: 1;
-            padding: 18px;
-            font-size: 1.1em;
-            font-weight: 600;
-            border: none;
-            border-radius: 12px;
-            cursor: pointer;
-            transition: all 0.3s;
-        }
-        .btn-start { background: linear-gradient(135deg, #00b894, #00cec9); color: white; }
-        .btn-start:hover { transform: translateY(-2px); box-shadow: 0 10px 30px rgba(0,184,148,0.3); }
-        .btn-start:disabled { background: #444; transform: none; box-shadow: none; cursor: not-allowed; }
-        .btn-stop { background: linear-gradient(135deg, #e74c3c, #c0392b); color: white; }
-        .btn-dashboard { background: linear-gradient(135deg, #667eea, #764ba2); color: white; }
-
-        .config-panel {
-            background: rgba(255,255,255,0.08);
-            border-radius: 15px;
-            padding: 20px;
-            margin-bottom: 20px;
-        }
         .config-row {
             display: grid;
             grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
             gap: 15px;
-            margin-bottom: 15px;
+            margin-bottom: 20px;
         }
         .config-group label {
             display: block;
@@ -317,50 +343,95 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             color: #fff;
             font-size: 1em;
         }
-        .config-group input:focus {
-            outline: 2px solid #667eea;
-        }
+        .config-group input:focus { outline: 2px solid #667eea; }
         .airport-input {
             text-transform: uppercase;
             font-weight: 600;
             letter-spacing: 2px;
         }
 
-        .status-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 15px; margin-bottom: 20px; }
-        .status-item {
-            background: rgba(0,0,0,0.3);
-            padding: 15px;
-            border-radius: 10px;
-            text-align: center;
-        }
-        .status-label { font-size: 0.85em; color: #888; margin-bottom: 5px; }
-        .status-value { font-size: 1.3em; font-weight: 600; }
-        .status-value.running { color: #00b894; }
-        .status-value.waiting { color: #f39c12; }
-
-        .vpn-alert {
-            background: linear-gradient(135deg, #f39c12, #e74c3c);
-            padding: 25px;
-            border-radius: 12px;
-            text-align: center;
-            font-size: 1.4em;
+        .controls { display: flex; gap: 15px; margin-bottom: 20px; }
+        button {
+            flex: 1;
+            padding: 18px;
+            font-size: 1.1em;
             font-weight: 600;
-            margin-bottom: 20px;
-            display: none;
-            animation: pulse 1.5s infinite;
+            border: none;
+            border-radius: 12px;
+            cursor: pointer;
+            transition: all 0.3s;
         }
-        .vpn-alert.active { display: block; }
-        @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.7; } }
+        .btn-start { background: linear-gradient(135deg, #00b894, #00cec9); color: white; }
+        .btn-start:hover { transform: translateY(-2px); box-shadow: 0 10px 30px rgba(0,184,148,0.3); }
+        .btn-start:disabled { background: #444; transform: none; box-shadow: none; cursor: not-allowed; }
+        .btn-stop { background: linear-gradient(135deg, #e74c3c, #c0392b); color: white; display: none; }
+
+        .summary-stats {
+            display: flex;
+            justify-content: space-around;
+            padding: 20px;
+            background: rgba(0,0,0,0.3);
+            border-radius: 12px;
+            margin-bottom: 20px;
+        }
+        .summary-stat { text-align: center; }
+        .summary-stat .value { font-size: 2.5em; font-weight: 700; color: #00b894; }
+        .summary-stat .label { font-size: 0.9em; color: #888; margin-top: 5px; }
+
+        .progress-bar {
+            width: 100%;
+            height: 10px;
+            background: rgba(255,255,255,0.1);
+            border-radius: 5px;
+            overflow: hidden;
+            margin-bottom: 20px;
+        }
+        .progress-fill {
+            height: 100%;
+            background: linear-gradient(90deg, #667eea, #00b894);
+            transition: width 0.5s ease;
+        }
+
+        .scanner-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+            gap: 15px;
+        }
+        .scanner-card {
+            background: rgba(0,0,0,0.3);
+            border-radius: 12px;
+            padding: 15px;
+            text-align: center;
+            border: 2px solid transparent;
+            transition: all 0.3s;
+        }
+        .scanner-card.starting { border-color: #888; }
+        .scanner-card.connecting { border-color: #f39c12; }
+        .scanner-card.connected { border-color: #3498db; }
+        .scanner-card.scraping { border-color: #00b894; animation: pulse 1.5s infinite; }
+        .scanner-card.complete { border-color: #27ae60; background: rgba(39, 174, 96, 0.2); }
+        .scanner-card.error { border-color: #e74c3c; background: rgba(231, 76, 60, 0.2); }
+
+        @keyframes pulse {
+            0%, 100% { box-shadow: 0 0 5px rgba(0, 184, 148, 0.5); }
+            50% { box-shadow: 0 0 20px rgba(0, 184, 148, 0.8); }
+        }
+
+        .scanner-country { font-size: 1.4em; font-weight: 700; margin-bottom: 5px; }
+        .scanner-status { font-size: 0.85em; color: #888; text-transform: capitalize; }
+        .scanner-flights { font-size: 1.1em; color: #00b894; font-weight: 600; margin-top: 8px; }
+        .scanner-city { font-size: 0.75em; color: #666; margin-top: 5px; }
 
         .log-box {
             background: #0a0a0a;
             border-radius: 10px;
             padding: 15px;
-            height: 350px;
+            height: 200px;
             overflow-y: auto;
             font-family: 'Monaco', 'Menlo', monospace;
             font-size: 0.85em;
             line-height: 1.6;
+            margin-top: 20px;
         }
         .log-line { padding: 2px 0; }
 
@@ -378,103 +449,113 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             border-radius: 20px;
             font-size: 0.8em;
         }
+
+        .empty-state {
+            text-align: center;
+            padding: 40px;
+            color: #666;
+        }
     </style>
 </head>
 <body>
     <div class="container">
         <header>
-            <h1>✈️ Flight Hacker</h1>
-            <div class="route">Find the cheapest flights with VPN price comparison</div>
+            <h1>Flight Hacker</h1>
+            <div class="subtitle">Multi-location price comparison with parallel Docker scanners</div>
         </header>
 
-        <div class="config-panel">
+        <div class="panel">
+            <h2>Search Configuration</h2>
             <div class="config-row">
                 <div class="config-group">
-                    <label>From (Airport Code)</label>
-                    <input type="text" id="originInput" class="airport-input" value="LHR" maxlength="3" placeholder="LHR">
+                    <label>From</label>
+                    <input type="text" id="originInput" class="airport-input" value="LHR" maxlength="3">
                 </div>
                 <div class="config-group">
-                    <label>To (Airport Code)</label>
-                    <input type="text" id="destInput" class="airport-input" value="BOM" maxlength="3" placeholder="BOM">
+                    <label>To</label>
+                    <input type="text" id="destInput" class="airport-input" value="BOM" maxlength="3">
                 </div>
                 <div class="config-group">
-                    <label>Departure Dates (comma separated)</label>
-                    <input type="text" id="depDatesInput" value="2026-02-16, 2026-02-17, 2026-02-18" placeholder="YYYY-MM-DD, YYYY-MM-DD">
+                    <label>Departure Date</label>
+                    <input type="date" id="depDateInput" value="2026-02-16">
                 </div>
                 <div class="config-group">
-                    <label>Return Dates (comma separated)</label>
-                    <input type="text" id="retDatesInput" value="2026-02-23, 2026-02-24" placeholder="YYYY-MM-DD, YYYY-MM-DD">
+                    <label>Return Date</label>
+                    <input type="date" id="retDateInput" value="2026-02-23">
                 </div>
+            </div>
+
+            <div class="controls">
+                <button class="btn-start" id="startBtn" onclick="startScan()">Start Parallel Scan</button>
+                <button class="btn-stop" id="stopBtn" onclick="stopScan()">Stop Scan</button>
             </div>
         </div>
 
-        <div class="vpn-alert" id="vpnAlert">
-            🔐 Connect your VPN now! Click "Quick Connect" in ProtonVPN
+        <div class="panel">
+            <h2>Scanner Progress</h2>
+
+            <div class="summary-stats">
+                <div class="summary-stat">
+                    <div class="value" id="scannerCount">0</div>
+                    <div class="label">Scanners</div>
+                </div>
+                <div class="summary-stat">
+                    <div class="value" id="completeCount">0</div>
+                    <div class="label">Complete</div>
+                </div>
+                <div class="summary-stat">
+                    <div class="value" id="totalFlightsCount">0</div>
+                    <div class="label">Flights Found</div>
+                </div>
+            </div>
+
+            <div class="progress-bar">
+                <div class="progress-fill" id="progressBar" style="width: 0%"></div>
+            </div>
+
+            <div class="scanner-grid" id="scannerGrid">
+                <div class="empty-state" style="grid-column: 1/-1;">
+                    Click "Start Parallel Scan" to launch scanners from multiple locations
+                </div>
+            </div>
+
+            <div class="log-box" id="logBox">
+                <div class="log-line">Ready to scan...</div>
+            </div>
         </div>
 
-        <div class="grid">
-            <div class="panel">
-                <h2>Scanner Control</h2>
-
-                <div class="controls">
-                    <button class="btn-start" id="startBtn" onclick="startScan()">▶ Start Scan</button>
-                    <button class="btn-stop" id="stopBtn" onclick="stopScan()" style="display:none">■ Stop</button>
-                </div>
-
-                <div class="status-grid">
-                    <div class="status-item">
-                        <div class="status-label">Status</div>
-                        <div class="status-value" id="statusText">Ready</div>
+        <div class="panel">
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:15px; flex-wrap:wrap; gap:10px;">
+                <h2>Flight Results</h2>
+                <div style="display:flex; align-items:center; gap:20px;">
+                    <div style="font-size:0.8em; color:#f39c12;">
+                        Tip: To book foreign prices, connect to VPN in that country first
                     </div>
-                    <div class="status-item">
-                        <div class="status-label">Location</div>
-                        <div class="status-value" id="locationText">--</div>
-                    </div>
-                    <div class="status-item">
-                        <div class="status-label">Phase</div>
-                        <div class="status-value" id="phaseText">--</div>
-                    </div>
-                    <div class="status-item">
-                        <div class="status-label">Flights Found</div>
-                        <div class="status-value" id="countText">0</div>
-                    </div>
-                </div>
-
-                <div class="log-box" id="logBox">
-                    <div class="log-line">Ready. Click "Start Scan" to begin.</div>
+                    <label style="display:flex; align-items:center; gap:8px; cursor:pointer;">
+                        <input type="checkbox" id="directOnly" onchange="loadResults()">
+                        <span>Direct only</span>
+                    </label>
                 </div>
             </div>
-
-            <div class="panel" style="grid-column: span 2;">
-                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:15px;">
-                    <h2>Flight Results</h2>
-                    <div style="display:flex; gap:10px; align-items:center;">
-                        <label style="display:flex; align-items:center; gap:5px; cursor:pointer;">
-                            <input type="checkbox" id="directOnly" onchange="loadResults()">
-                            <span>Direct flights only</span>
-                        </label>
-                    </div>
-                </div>
-                <table class="results-table">
-                    <thead>
-                        <tr>
-                            <th>Dates</th>
-                            <th>Outbound</th>
-                            <th>Return</th>
-                            <th>Airline</th>
-                            <th>Duration</th>
-                            <th>Stops</th>
-                            <th>Price</th>
-                            <th>Location</th>
-                            <th>Book</th>
-                        </tr>
-                    </thead>
-                    <tbody id="resultsBody">
-                        <tr><td colspan="9" style="color:#666">No results yet</td></tr>
-                    </tbody>
-                </table>
-                <div id="pagination" style="display:flex; justify-content:center; gap:10px; margin-top:20px;"></div>
-            </div>
+            <table class="results-table">
+                <thead>
+                    <tr>
+                        <th>Dates</th>
+                        <th>Outbound</th>
+                        <th>Return</th>
+                        <th>Airline</th>
+                        <th>Duration</th>
+                        <th>Stops</th>
+                        <th>Price</th>
+                        <th>Location</th>
+                        <th>Book</th>
+                    </tr>
+                </thead>
+                <tbody id="resultsBody">
+                    <tr><td colspan="9" class="empty-state">No results yet</td></tr>
+                </tbody>
+            </table>
+            <div id="pagination" style="display:flex; justify-content:center; gap:10px; margin-top:20px;"></div>
         </div>
     </div>
 
@@ -485,17 +566,13 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             document.getElementById('startBtn').disabled = true;
             document.getElementById('stopBtn').style.display = 'block';
             document.getElementById('logBox').innerHTML = '';
-            document.getElementById('resultsBody').innerHTML = '<tr><td colspan="9" style="color:#666">Scanning...</td></tr>';
-            document.getElementById('pagination').innerHTML = '';
-            document.getElementById('countText').textContent = '0';
+            document.getElementById('scannerGrid').innerHTML = '<div class="empty-state" style="grid-column:1/-1;">Starting scanners...</div>';
 
-            // Get config from inputs
             const config = {
-                origin: document.getElementById('originInput').value.trim(),
-                destination: document.getElementById('destInput').value.trim(),
-                departure_dates: document.getElementById('depDatesInput').value.split(',').map(d => d.trim()).filter(d => d),
-                return_dates: document.getElementById('retDatesInput').value.split(',').map(d => d.trim()).filter(d => d),
-                clear_db: true  // Clear old results
+                origin: document.getElementById('originInput').value.trim().toUpperCase(),
+                destination: document.getElementById('destInput').value.trim().toUpperCase(),
+                departure_date: document.getElementById('depDateInput').value,
+                return_date: document.getElementById('retDateInput').value
             };
 
             await fetch('/api/start', {
@@ -503,38 +580,48 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(config)
             });
-            pollInterval = setInterval(poll, 1000);
+
+            pollInterval = setInterval(pollStatus, 1000);
         }
 
         async function stopScan() {
             await fetch('/api/stop', { method: 'POST' });
             document.getElementById('startBtn').disabled = false;
             document.getElementById('stopBtn').style.display = 'none';
-            document.getElementById('vpnAlert').classList.remove('active');
             clearInterval(pollInterval);
         }
 
-        async function poll() {
+        async function pollStatus() {
             try {
-                const [statusRes, logsRes, dataRes] = await Promise.all([
-                    fetch('/api/status'),
-                    fetch('/api/logs'),
-                    fetch('/api/data')
+                const [statusRes, logsRes] = await Promise.all([
+                    fetch('/api/scanner-status'),
+                    fetch('/api/logs')
                 ]);
 
-                const status = await statusRes.json();
+                const data = await statusRes.json();
                 const logs = await logsRes.json();
-                const data = await dataRes.json();
 
-                // Update status
-                document.getElementById('statusText').textContent = status.running ? 'Scanning...' : 'Ready';
-                document.getElementById('statusText').className = 'status-value' + (status.running ? ' running' : '');
-                document.getElementById('locationText').textContent = status.location;
-                document.getElementById('phaseText').textContent = status.phase || '--';
-                document.getElementById('countText').textContent = data.stats?.total_searches || 0;
+                // Update summary
+                document.getElementById('scannerCount').textContent = data.summary?.total_scanners || 0;
+                document.getElementById('completeCount').textContent = data.summary?.complete || 0;
+                document.getElementById('totalFlightsCount').textContent = data.summary?.total_flights || 0;
 
-                // VPN alert
-                document.getElementById('vpnAlert').classList.toggle('active', status.vpn_waiting);
+                // Progress bar
+                const total = data.summary?.total_scanners || 1;
+                const complete = data.summary?.complete || 0;
+                document.getElementById('progressBar').style.width = Math.round((complete / total) * 100) + '%';
+
+                // Scanner cards
+                if (data.scanners?.length > 0) {
+                    document.getElementById('scannerGrid').innerHTML = data.scanners.map(s => `
+                        <div class="scanner-card ${s.status}">
+                            <div class="scanner-country">${s.country}</div>
+                            <div class="scanner-status">${s.status}</div>
+                            <div class="scanner-flights">${s.progress?.flights_found || 0} flights</div>
+                            ${s.vpn_city ? `<div class="scanner-city">${s.vpn_city}</div>` : ''}
+                        </div>
+                    `).join('');
+                }
 
                 // Logs
                 if (logs.length > 0) {
@@ -548,33 +635,17 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                     box.scrollTop = box.scrollHeight;
                 }
 
-                // Results
-                if (data.best_deals?.length > 0) {
-                    document.getElementById('resultsBody').innerHTML = data.best_deals.slice(0, 8).map(d => `
-                        <tr>
-                            <td>${d.departure} → ${d.return}</td>
-                            <td class="price">£${d.price?.toFixed(0) || '--'}</td>
-                            <td>${d.airline || 'Unknown'}</td>
-                            <td><span class="vpn-badge">${d.vpn || 'UK'}</span></td>
-                        </tr>
-                    `).join('');
-                }
-
                 // Stop polling when done
-                if (!status.running && !status.vpn_waiting) {
+                if (!data.parallel_running && data.summary?.complete >= data.summary?.total_scanners && data.summary?.total_scanners > 0) {
                     clearInterval(pollInterval);
                     document.getElementById('startBtn').disabled = false;
                     document.getElementById('stopBtn').style.display = 'none';
+                    loadResults();
                 }
             } catch (e) {
-                console.error(e);
+                console.error('Poll error:', e);
             }
         }
-
-        // Initial status
-        fetch('/api/status').then(r => r.json()).then(s => {
-            document.getElementById('locationText').textContent = s.location;
-        });
 
         let currentPage = 1;
 
@@ -584,12 +655,10 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             const res = await fetch(`/api/data?page=${page}&per_page=10&direct=${directOnly}`);
             const data = await res.json();
 
-            document.getElementById('countText').textContent = data.stats?.total_searches || 0;
-
             if (data.best_deals?.length > 0) {
                 document.getElementById('resultsBody').innerHTML = data.best_deals.map(d => `
                     <tr>
-                        <td>${d.departure}<br><small style="color:#888">→ ${d.return}</small></td>
+                        <td>${d.departure}<br><small style="color:#888">to ${d.return}</small></td>
                         <td>${d.times || '--'}</td>
                         <td>${d.return_times || '--'}</td>
                         <td><strong>${d.airline || 'Unknown'}</strong></td>
@@ -597,32 +666,37 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                         <td>${d.stops === 0 ? '<span style="color:#00b894">Direct</span>' : d.stops + ' stop'}</td>
                         <td class="price">£${d.price?.toFixed(0) || '--'}</td>
                         <td><span class="vpn-badge">${d.vpn || 'UK'}</span></td>
-                        <td>${d.url ? `<a href="${d.url}" target="_blank" style="color:#667eea;text-decoration:none;">Book →</a>` : '--'}</td>
+                        <td>${d.url ? `<a href="${d.url}" target="_blank" style="color:#667eea;" onclick="return confirmBook('${d.vpn}')">Book</a>` : '--'}</td>
                     </tr>
                 `).join('');
 
-                // Pagination
                 const p = data.pagination;
-                if (p && p.total_pages > 1) {
-                    let pagHtml = '';
-                    if (p.page > 1) {
-                        pagHtml += `<button onclick="loadResults(${p.page - 1})" style="padding:8px 15px;border:none;border-radius:5px;background:#333;color:#fff;cursor:pointer;">← Prev</button>`;
-                    }
-                    pagHtml += `<span style="padding:8px 15px;">Page ${p.page} of ${p.total_pages} (${p.total} flights)</span>`;
-                    if (p.page < p.total_pages) {
-                        pagHtml += `<button onclick="loadResults(${p.page + 1})" style="padding:8px 15px;border:none;border-radius:5px;background:#333;color:#fff;cursor:pointer;">Next →</button>`;
-                    }
-                    document.getElementById('pagination').innerHTML = pagHtml;
+                if (p?.total_pages > 1) {
+                    let html = '';
+                    if (p.page > 1) html += `<button onclick="loadResults(${p.page-1})" style="padding:8px 15px;border:none;border-radius:5px;background:#333;color:#fff;cursor:pointer;">Prev</button>`;
+                    html += `<span style="padding:8px 15px;">Page ${p.page} of ${p.total_pages}</span>`;
+                    if (p.page < p.total_pages) html += `<button onclick="loadResults(${p.page+1})" style="padding:8px 15px;border:none;border-radius:5px;background:#333;color:#fff;cursor:pointer;">Next</button>`;
+                    document.getElementById('pagination').innerHTML = html;
                 } else {
-                    document.getElementById('pagination').innerHTML = `<span style="color:#666">${data.pagination?.total || 0} flights total</span>`;
+                    document.getElementById('pagination').innerHTML = `<span style="color:#666">${p?.total || 0} flights</span>`;
                 }
             } else {
-                document.getElementById('resultsBody').innerHTML = '<tr><td colspan="8" style="color:#666">No results yet</td></tr>';
+                document.getElementById('resultsBody').innerHTML = '<tr><td colspan="9" class="empty-state">No results yet</td></tr>';
                 document.getElementById('pagination').innerHTML = '';
             }
         }
 
-        // Initial load and poll every 5s
+        function confirmBook(location) {
+            if (!location || location.includes('UK') || location.includes('GB')) {
+                return true; // UK prices, no VPN needed
+            }
+
+            const country = location.split(' - ')[0];
+            const msg = `This price was found from ${location}.\\n\\nTo get this price, you need to:\\n1. Connect to a VPN in ${country}\\n2. Then click Book again\\n\\nContinue anyway?`;
+            return confirm(msg);
+        }
+
+        // Initial load
         loadResults();
         setInterval(() => loadResults(currentPage), 5000);
     </script>
@@ -633,15 +707,8 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(html.encode())
 
-    def serve_dashboard(self):
-        # Original dashboard redirect or serve
-        self.send_response(302)
-        self.send_header('Location', '/')
-        self.end_headers()
-
     def serve_api_data(self):
         try:
-            # Parse query params for pagination and filters
             query = parse_qs(urlparse(self.path).query)
             page = int(query.get('page', [1])[0])
             per_page = int(query.get('per_page', [10])[0])
@@ -651,7 +718,6 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             conn = sqlite3.connect(DB_PATH)
             cursor = conn.cursor()
 
-            # Base filter
             where_clause = "WHERE price_gbp IS NOT NULL"
             if direct_only:
                 where_clause += " AND stops = 0"
@@ -689,8 +755,6 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                     'url': r[7],
                     'stops': r[8],
                     'duration': dur_str,
-                    'dep_time': metadata.get('dep_time', ''),
-                    'arr_time': metadata.get('arr_time', ''),
                     'times': metadata.get('times', ''),
                     'return_times': metadata.get('return_times', '')
                 })
@@ -701,12 +765,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             self.send_json({
                 'stats': {'best_price': best_price, 'total_searches': total},
                 'best_deals': deals,
-                'pagination': {
-                    'page': page,
-                    'per_page': per_page,
-                    'total': total,
-                    'total_pages': total_pages
-                }
+                'pagination': {'page': page, 'per_page': per_page, 'total': total, 'total_pages': total_pages}
             })
         except Exception as e:
             self.send_json({'error': str(e), 'stats': {}, 'best_deals': [], 'pagination': {}})
@@ -720,48 +779,6 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 break
         self.send_json(logs)
 
-    def serve_status(self):
-        loc = get_current_location()
-        scan_status['location'] = f"{loc['country_code']} - {loc['city']}"
-        self.send_json(scan_status)
-
-    def start_scan(self):
-        global search_config
-        # Read config from POST body
-        try:
-            content_length = int(self.headers.get('Content-Length', 0))
-            if content_length > 0:
-                body = self.rfile.read(content_length).decode('utf-8')
-                data = json.loads(body)
-                if data.get('origin'):
-                    search_config['origin'] = data['origin'].upper()
-                if data.get('destination'):
-                    search_config['destination'] = data['destination'].upper()
-                if data.get('departure_dates'):
-                    search_config['departure_dates'] = data['departure_dates']
-                if data.get('return_dates'):
-                    search_config['return_dates'] = data['return_dates']
-
-                # Clear database if requested
-                if data.get('clear_db'):
-                    try:
-                        conn = sqlite3.connect(DB_PATH)
-                        conn.execute('DELETE FROM flights')
-                        conn.commit()
-                        conn.close()
-                    except:
-                        pass
-        except:
-            pass
-
-        if not scan_status['running']:
-            threading.Thread(target=run_full_scan, daemon=True).start()
-        self.send_json({'ok': True})
-
-    def stop_scan(self):
-        scan_status['running'] = False
-        self.send_json({'ok': True})
-
     def send_json(self, data):
         self.send_response(200)
         self.send_header('Content-type', 'application/json')
@@ -771,20 +788,15 @@ class Handler(http.server.SimpleHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    import os
     os.chdir(str(Path(__file__).parent))
 
-    # Init DB
     init_database()
+    OUTPUT_DIR.mkdir(exist_ok=True)
 
-    # Get initial location
-    loc = get_current_location()
-    scan_status['location'] = f"{loc['country_code']} - {loc['city']}"
-
-    print(f"\n{'='*60}")
-    print("✈️  Flight Hacker")
-    print(f"{'='*60}")
-    print(f"\n🌐 Open: http://localhost:{PORT}")
+    print(f"\n{'='*50}")
+    print("Flight Hacker")
+    print(f"{'='*50}")
+    print(f"\nOpen: http://localhost:{PORT}")
     print(f"\nPress Ctrl+C to stop\n")
 
     with socketserver.TCPServer(("", PORT), Handler) as httpd:
