@@ -1,0 +1,41 @@
+# Environment variables (contains credentials)
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.venv/
+venv/
+
+# Debug files
+debug_*.png
+debug_*.html
+debug_*.txt
+
+# Database
+*.db
+
+# Output files (regenerated on each scan)
+output/*.json
+
+# VPN credentials (sensitive)
+vpn_configs/credentials.txt
+vpn_configs/*.ovpn
+
+# Keep the template and README
+!vpn_configs/credentials.txt.template
+!vpn_configs/README.md
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Claude
+.claude/

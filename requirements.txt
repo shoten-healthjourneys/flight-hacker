@@ -1,0 +1,11 @@
+# Flight Hacker - Python Dependencies
+# Install with: pip3 install -r requirements.txt
+
+# Core dependencies
+requests>=2.28.0
+
+# Web scraping with headless browser
+playwright>=1.40.0
+
+# After installing, run this ONE-TIME setup command:
+# python3 -m playwright install chromium
